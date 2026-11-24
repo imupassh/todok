@@ -1,0 +1,16 @@
+# 환경변수 및 비밀정보
+.env
+.env.*
+
+# 공유용 환경변수 예시는 GitHub에 포함입니다~
+!.env.example
+
+# Python 가상환경 및 캐시
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# macOS 및 VS Code 개인 설정
+.DS_Store
+.vscode/
