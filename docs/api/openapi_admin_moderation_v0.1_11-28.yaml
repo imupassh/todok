@@ -1,0 +1,783 @@
+openapi: 3.0.3
+info:
+  title: 토독(Todok) 운영자 웹 · 신고/반응 공용 API
+  version: 0.1.0-draft
+  description: |
+    개발자 2 담당 11/28 작업: 신고·반응 공용 3개 + 운영자 웹 API 14개 = 17개 API 필드.
+    작성일 2026-11-28. 기준: 통합ERD_v1.0_11-28 · API 명세서 v1.0 · MoSCoW v4.0.
+
+    [공통 규칙] (openapi_letters와 동일)
+    - 응답 봉투: 성공 `{ "data": <body> }` / 실패 `{ "error": { code, message, details? } }` (스키마는 data 본문만 표기)
+    - 앱 노출 식별자는 public_id(UUID). 운영자 웹 전용 자원(review/report/sanction)은 운영자 전용 내부 정수 id 사용.
+    - 시간 ISO-8601 UTC. 목록은 커서 페이지네이션(cursor/limit, meta.nextCursor).
+    - 공용 3개(reaction-types·report-reasons·reports)는 앱 사용자(로그인) 대상.
+    - 운영자 웹 14개(/admin/*)는 운영자 권한 계정만. 비운영자는 403 FORBIDDEN. 구축 방식(SPA/SSR 등)은 미정.
+
+servers:
+  - url: https://api.todok.example/api/v1
+    description: (초안) 운영
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: moderation-shared
+    description: 신고 · 반응 공용 (앱, 3)
+  - name: admin-review
+    description: 운영자 - 검수 (A-01·A-02)
+  - name: admin-report
+    description: 운영자 - 신고·제재 (A-03·A-04·A-05)
+  - name: admin-content
+    description: 운영자 - 콘텐츠 관리 (A-06·A-07·A-08·A-10)
+  - name: admin-ops
+    description: 운영자 - 운영 설정·약관·지표 (A-09·A-11·A-12)
+
+paths:
+  # ============================================================
+  # 공용 3개 (앱)
+  # ============================================================
+  /reaction-types:
+    get:
+      tags: [moderation-shared]
+      summary: 정해진 긍정 반응 목록 (C-01)
+      description: 긍정 반응만. 자유 댓글 없음(C-11 Won't).
+      operationId: getReactionTypes
+      responses:
+        '200':
+          description: 반응 종류
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/ReactionType' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /report-reasons:
+    get:
+      tags: [moderation-shared]
+      summary: 신고 사유 목록 (S-03)
+      description: 목소리를 평가하는 사유는 넣지 않는다.
+      operationId: getReportReasons
+      responses:
+        '200':
+          description: 신고 사유
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/ReportReason' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /reports:
+    post:
+      tags: [moderation-shared]
+      summary: 낭독·편지 신고 → 신고자에게만 숨김, 신고 대기열 등록 (S-03·A-03)
+      description: |
+        같은 사람의 중복 신고는 1번으로 셈(UNIQUE reporter_id,target). 서로 다른 3명 신고 시
+        확인 전까지 임시 비공개(A-05, Could). 신고 즉시 신고자 본인 화면에서는 대상이 숨겨진다.
+      operationId: createReport
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReportCreateRequest' }
+      responses:
+        '201':
+          description: 신고 접수
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  reportId: { type: integer, format: int64 }
+                  hiddenForReporter: { type: boolean, example: true }
+        '409':
+          description: 이미 신고한 대상(중복)
+          content: { application/json: { schema: { $ref: '#/components/schemas/ApiError' }, example: { error: { code: ALREADY_REPORTED, message: "이미 신고한 대상이에요" } } } }
+        '410':
+          description: 이미 숨김·삭제된 대상
+          content: { application/json: { schema: { $ref: '#/components/schemas/ApiError' }, example: { error: { code: CONTENT_UNAVAILABLE, message: "대상을 찾을 수 없어요" } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ============================================================
+  # 운영자 웹 14개 (/admin/*)
+  # ============================================================
+  /admin/reviews:
+    get:
+      tags: [admin-review]
+      summary: 검수 대기열 (글/음성) (A-01·A-02)
+      description: |
+        type=request → 글 검수(제목·문구·금지어 결과).
+        type=reading|letter → 음성 검수(음성 서명 URL·STT 글자·원문 대조·금지어 결과).
+        STT 글자는 대상(readings/letters)의 stt_text를 조인해 제공(review_queue에 중복 저장 안 함).
+      operationId: getAdminReviews
+      parameters:
+        - name: type
+          in: query
+          required: true
+          schema: { type: string, enum: [request, reading, letter] }
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: 검수 대기열
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  pendingCount: { type: integer, description: 대기 건수 }
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/ReviewItem' }
+                  meta: { $ref: '#/components/schemas/PageMeta' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /admin/reviews/{id}/approve:
+    post:
+      tags: [admin-review]
+      summary: 승인 → 공개·게시·전달 + 푸시 (A-01·A-02)
+      description: 요청은 승인 시각부터 24시간 게시 시작. 낭독·편지는 PUBLISHED + 도착/공개 푸시.
+      operationId: approveReview
+      parameters: [ { $ref: '#/components/parameters/AdminId' } ]
+      responses:
+        '200':
+          description: 승인 처리됨
+          content: { application/json: { schema: { $ref: '#/components/schemas/ReviewDecisionResult' } } }
+        '409':
+          description: 이미 처리된 항목
+          content: { application/json: { schema: { $ref: '#/components/schemas/ApiError' }, example: { error: { code: ALREADY_DECIDED, message: "이미 처리된 항목이에요" } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /admin/reviews/{id}/reject:
+    post:
+      tags: [admin-review]
+      summary: 반려 (안전 사유만) + 안내 푸시 (A-01·A-02)
+      description: 목소리 평가 사유는 없다. 반려 사유 코드 기록.
+      operationId: rejectReview
+      parameters: [ { $ref: '#/components/parameters/AdminId' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reasonCode]
+              properties:
+                reasonCode: { type: string, description: 안전 사유 코드 }
+                memo: { type: string, nullable: true, description: 운영자 메모(비공개) }
+      responses:
+        '200':
+          description: 반려 처리됨
+          content: { application/json: { schema: { $ref: '#/components/schemas/ReviewDecisionResult' } } }
+        '409':
+          description: 이미 처리된 항목
+          content: { application/json: { schema: { $ref: '#/components/schemas/ApiError' }, example: { error: { code: ALREADY_DECIDED, message: "이미 처리된 항목이에요" } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /admin/reports:
+    get:
+      tags: [admin-report]
+      summary: 신고 대기열 (A-03·A-04)
+      description: 심각한 사유·신고 많은 건 먼저(Should). 대상 미리보기(음성 서명 URL·STT·글 원문) 포함.
+      operationId: getAdminReports
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema: { type: string, enum: [PENDING, RESOLVED], default: PENDING }
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: 신고 대기열
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  pendingCount: { type: integer }
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/ReportQueueItem' }
+                  meta: { $ref: '#/components/schemas/PageMeta' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /admin/reports/{id}/decision:
+    post:
+      tags: [admin-report]
+      summary: 신고 판정 → 제재 단계 자동 계산 (A-03)
+      description: |
+        decision=NO_ISSUE(문제없음) 또는 ACTIONED(문제있음). ACTIONED면 대상 내림(WITHDRAWN) +
+        피신고자 제재 단계 자동 계산(누적 1회 내림·2회 경고·3회 7일 올리기 제한).
+      operationId: decideReport
+      parameters: [ { $ref: '#/components/parameters/AdminId' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [decision]
+              properties:
+                decision: { type: string, enum: [NO_ISSUE, ACTIONED] }
+                memo: { type: string, nullable: true }
+      responses:
+        '200':
+          description: 판정 처리됨
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  reportId: { type: integer, format: int64 }
+                  resolution: { type: string, enum: [NO_ISSUE, ACTIONED] }
+                  sanction:
+                    nullable: true
+                    allOf: [ { $ref: '#/components/schemas/Sanction' } ]
+                    description: ACTIONED일 때 생성된 제재(없으면 null)
+        '409':
+          description: 이미 처리된 신고
+          content: { application/json: { schema: { $ref: '#/components/schemas/ApiError' }, example: { error: { code: ALREADY_DECIDED, message: "이미 처리된 신고예요" } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /admin/users/{id}/sanctions:
+    get:
+      tags: [admin-report]
+      summary: 사용자별 제재 기록 (A-03)
+      operationId: getUserSanctions
+      parameters: [ { $ref: '#/components/parameters/PublicId' } ]
+      responses:
+        '200':
+          description: 제재·신고 이력
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  userId: { type: string, format: uuid }
+                  activeBlockUntil: { type: string, format: date-time, nullable: true, description: 진행 중 올리기 제한 해제 일시 }
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Sanction' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /admin/passages:
+    get:
+      tags: [admin-content]
+      summary: 낭독 문장 목록 (A-06)
+      operationId: getAdminPassages
+      parameters:
+        - { name: category, in: query, required: false, schema: { type: string } }
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: 문장 목록
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/Passage' } }
+                  meta: { $ref: '#/components/schemas/PageMeta' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [admin-content]
+      summary: 낭독 문장 등록 (A-06) — 글자 수·제한 시간 자동 계산
+      operationId: createPassage
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/PassageUpsert' } } }
+      responses:
+        '201': { description: 등록됨, content: { application/json: { schema: { $ref: '#/components/schemas/Passage' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /admin/passages/{id}:
+    put:
+      tags: [admin-content]
+      summary: 낭독 문장 수정 (A-06)
+      operationId: updatePassage
+      parameters: [ { $ref: '#/components/parameters/AdminId' } ]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/PassageUpsert' } } }
+      responses:
+        '200': { description: 수정됨, content: { application/json: { schema: { $ref: '#/components/schemas/Passage' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    delete:
+      tags: [admin-content]
+      summary: 낭독 문장 비활성/삭제 (A-06)
+      operationId: deletePassage
+      parameters: [ { $ref: '#/components/parameters/AdminId' } ]
+      responses:
+        '204': { description: 삭제됨 }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /admin/stamps:
+    get:
+      tags: [admin-content]
+      summary: 우표 목록 (A-07)
+      operationId: getAdminStamps
+      responses:
+        '200': { description: 우표 목록, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/StampAdmin' } } } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [admin-content]
+      summary: 우표 등록 (A-07)
+      operationId: createStamp
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/StampUpsert' } } }
+      responses:
+        '201': { description: 등록됨, content: { application/json: { schema: { $ref: '#/components/schemas/StampAdmin' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /admin/stamps/{id}:
+    put:
+      tags: [admin-content]
+      summary: 우표 수정 (A-07)
+      operationId: updateStamp
+      parameters: [ { $ref: '#/components/parameters/AdminId' } ]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/StampUpsert' } } }
+      responses:
+        '200': { description: 수정됨, content: { application/json: { schema: { $ref: '#/components/schemas/StampAdmin' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    delete:
+      tags: [admin-content]
+      summary: 우표 삭제 (A-07)
+      operationId: deleteStamp
+      parameters: [ { $ref: '#/components/parameters/AdminId' } ]
+      responses:
+        '204': { description: 삭제됨 }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /admin/banned-words:
+    get:
+      tags: [admin-content]
+      summary: 금지어·피싱 패턴 목록 (A-08)
+      operationId: getBannedWords
+      parameters:
+        - { name: type, in: query, required: false, schema: { type: string, enum: [WORD, PHISHING] } }
+      responses:
+        '200': { description: 금지어 목록, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/BannedWord' } } } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [admin-content]
+      summary: 금지어·피싱 패턴 추가 (A-08)
+      operationId: createBannedWord
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pattern, type]
+              properties:
+                pattern: { type: string }
+                type: { type: string, enum: [WORD, PHISHING] }
+                isRegex: { type: boolean, default: false }
+      responses:
+        '201': { description: 추가됨, content: { application/json: { schema: { $ref: '#/components/schemas/BannedWord' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /admin/banned-words/{id}:
+    delete:
+      tags: [admin-content]
+      summary: 금지어 삭제 (A-08)
+      operationId: deleteBannedWord
+      parameters: [ { $ref: '#/components/parameters/AdminId' } ]
+      responses:
+        '204': { description: 삭제됨 }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /admin/request-examples:
+    get:
+      tags: [admin-content]
+      summary: 편지 요청 예시 문구 칩 목록 (A-10)
+      operationId: getRequestExamples
+      responses:
+        '200': { description: 예시 칩, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/RequestExample' } } } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [admin-content]
+      summary: 예시 문구 추가 (A-10)
+      operationId: createRequestExample
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [text], properties: { text: { type: string }, sortOrder: { type: integer } } } } }
+      responses:
+        '201': { description: 추가됨, content: { application/json: { schema: { $ref: '#/components/schemas/RequestExample' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /admin/request-examples/{id}:
+    put:
+      tags: [admin-content]
+      summary: 예시 문구 수정 (A-10)
+      operationId: updateRequestExample
+      parameters: [ { $ref: '#/components/parameters/AdminId' } ]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, properties: { text: { type: string }, sortOrder: { type: integer } } } } }
+      responses:
+        '200': { description: 수정됨, content: { application/json: { schema: { $ref: '#/components/schemas/RequestExample' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    delete:
+      tags: [admin-content]
+      summary: 예시 문구 삭제 (A-10)
+      operationId: deleteRequestExample
+      parameters: [ { $ref: '#/components/parameters/AdminId' } ]
+      responses:
+        '204': { description: 삭제됨 }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /admin/settings:
+    get:
+      tags: [admin-ops]
+      summary: 운영 설정(서비스 수치) 조회 (A-09)
+      operationId: getAdminSettings
+      responses:
+        '200':
+          description: 설정 목록
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/Setting' } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    put:
+      tags: [admin-ops]
+      summary: 운영 설정 수정 (A-09)
+      description: 하루 녹음/편지/요청 제한, 카테고리별 글자 수·제한 시간 등.
+      operationId: updateAdminSettings
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                items:
+                  type: array
+                  items:
+                    type: object
+                    required: [key, value]
+                    properties:
+                      key: { type: string }
+                      value: { type: string }
+      responses:
+        '200':
+          description: 수정됨
+          content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/Setting' } } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /admin/policies/{type}:
+    put:
+      tags: [admin-ops]
+      summary: 약관·방침 새 버전과 시행일 등록 (A-11)
+      description: 앱은 /policies에서 받아 표시. 등록 시 해당 type의 is_current 전환.
+      operationId: upsertPolicy
+      parameters:
+        - { name: type, in: path, required: true, schema: { type: string, enum: [TERMS, PRIVACY, MARKETING] } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [version, title, content, effectiveAt, isRequired]
+              properties:
+                version: { type: string }
+                title: { type: string }
+                content: { type: string }
+                isRequired: { type: boolean }
+                effectiveAt: { type: string, format: date-time }
+      responses:
+        '201':
+          description: 등록됨
+          content: { application/json: { schema: { $ref: '#/components/schemas/Policy' } } }
+        '409':
+          description: 중복 버전
+          content: { application/json: { schema: { $ref: '#/components/schemas/ApiError' }, example: { error: { code: DUPLICATE_VERSION, message: "이미 있는 버전이에요" } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /admin/metrics:
+    get:
+      tags: [admin-ops]
+      summary: 운영 지표 대시보드 (A-12, Should)
+      description: 처음엔 백엔드가 DB에서 직접 조회. 기간 파라미터로 집계.
+      operationId: getAdminMetrics
+      parameters:
+        - { name: from, in: query, required: false, schema: { type: string, format: date } }
+        - { name: to, in: query, required: false, schema: { type: string, format: date } }
+      responses:
+        '200':
+          description: 지표
+          content: { application/json: { schema: { $ref: '#/components/schemas/Metrics' } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+# ================================================================
+components:
+  securitySchemes:
+    bearerAuth: { type: http, scheme: bearer, bearerFormat: JWT }
+
+  parameters:
+    PublicId:
+      name: id
+      in: path
+      required: true
+      description: 자원의 public_id (UUID)
+      schema: { type: string, format: uuid }
+    AdminId:
+      name: id
+      in: path
+      required: true
+      description: 운영자 전용 내부 자원 id
+      schema: { type: integer, format: int64 }
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      schema: { type: string }
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema: { type: integer, default: 20, minimum: 1, maximum: 50 }
+
+  responses:
+    Unauthorized:
+      description: 로그인 토큰 만료·누락
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+          example: { error: { code: AUTH_EXPIRED, message: "다시 로그인해 주세요" } }
+    Forbidden:
+      description: 운영자 권한 없음
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+          example: { error: { code: FORBIDDEN, message: "권한이 없어요" } }
+
+  schemas:
+    ApiError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum:
+                [AUTH_EXPIRED, FORBIDDEN, SERVER_ERROR, CONTENT_UNAVAILABLE,
+                 ALREADY_REPORTED, ALREADY_DECIDED, DUPLICATE_VERSION, VALIDATION_ERROR]
+            message: { type: string }
+            details: { type: object, nullable: true, additionalProperties: true }
+
+    PageMeta:
+      type: object
+      properties:
+        nextCursor: { type: string, nullable: true }
+
+    # ---------- 공용 ----------
+    ReactionType:
+      type: object
+      properties:
+        code: { type: string, example: WARM }
+        label: { type: string, example: "목소리가 따뜻해요" }
+        emoji: { type: string, nullable: true }
+        sortOrder: { type: integer }
+
+    ReportReason:
+      type: object
+      properties:
+        code: { type: string, example: PERSONAL_INFO }
+        label: { type: string, example: "개인정보·연락처 노출" }
+        severity: { type: integer, description: 정렬·우선순위용(높을수록 심각) }
+
+    ReportCreateRequest:
+      type: object
+      required: [targetType, targetId, reasonCode]
+      properties:
+        targetType: { type: string, enum: [READING, LETTER] }
+        targetId: { type: string, format: uuid, description: 대상 public_id }
+        reasonCode: { type: string }
+
+    # ---------- 검수 ----------
+    ReviewTargetType: { type: string, enum: [REQUEST, READING, LETTER] }
+    ReviewItem:
+      type: object
+      properties:
+        id: { type: integer, format: int64, description: review_queue id }
+        targetType: { $ref: '#/components/schemas/ReviewTargetType' }
+        targetId: { type: string, format: uuid }
+        queueType: { type: string, enum: [TEXT, VOICE] }
+        createdAt: { type: string, format: date-time, description: 대기 시작(대기시간 지표 기준) }
+        # TEXT(요청)
+        title: { type: string, nullable: true }
+        content: { type: string, nullable: true }
+        # VOICE(낭독·편지)
+        audioUrl: { type: string, format: uri, nullable: true, description: 검수용 짧은 서명 URL }
+        sttText: { type: string, nullable: true, description: 대상 stt_text 조인 }
+        sourceText: { type: string, nullable: true, description: 낭독 원문(passage) 대조용 }
+        filterResult:
+          type: object
+          nullable: true
+          description: 금지어·원문대조·무음 점검 결과
+          additionalProperties: true
+
+    ReviewDecisionResult:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        status: { type: string, enum: [APPROVED, REJECTED] }
+        decidedAt: { type: string, format: date-time }
+
+    # ---------- 신고·제재 ----------
+    ReportQueueItem:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        targetType: { type: string, enum: [READING, LETTER] }
+        targetId: { type: string, format: uuid }
+        reasonCode: { type: string }
+        severity: { type: integer }
+        reportCount: { type: integer, description: 서로 다른 신고자 수(DISTINCT) }
+        audioUrl: { type: string, format: uri, nullable: true }
+        sttText: { type: string, nullable: true }
+        sourceText: { type: string, nullable: true, description: 글 원문(요청 문구/낭독 원문) }
+        createdAt: { type: string, format: date-time }
+
+    SanctionLevel: { type: string, enum: [WITHDRAW, WARNING, UPLOAD_BLOCK] }
+    Sanction:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        level: { $ref: '#/components/schemas/SanctionLevel' }
+        reason: { type: string, nullable: true }
+        reportId: { type: integer, format: int64, nullable: true }
+        startsAt: { type: string, format: date-time }
+        endsAt: { type: string, format: date-time, nullable: true, description: UPLOAD_BLOCK 해제 일시(7일) }
+        createdAt: { type: string, format: date-time }
+
+    # ---------- 콘텐츠 관리 ----------
+    Passage:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        text: { type: string }
+        category: { type: string, description: 명언/시/소설 등 }
+        mood: { type: string, nullable: true }
+        charCount: { type: integer, description: 자동 계산 }
+        maxRecordSec: { type: integer, description: 글자수 기반 자동 계산(없으면 settings 기본값) }
+        isActive: { type: boolean }
+    PassageUpsert:
+      type: object
+      required: [text, category]
+      properties:
+        text: { type: string }
+        category: { type: string }
+        mood: { type: string, nullable: true }
+        isActive: { type: boolean, default: true }
+
+    StampAdmin:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        name: { type: string }
+        imageUrl: { type: string, format: uri }
+        isActive: { type: boolean }
+        sortOrder: { type: integer }
+    StampUpsert:
+      type: object
+      required: [name, imageKey]
+      properties:
+        name: { type: string }
+        imageKey: { type: string, description: 업로드된 이미지 키 }
+        isActive: { type: boolean, default: true }
+        sortOrder: { type: integer, default: 0 }
+
+    BannedWord:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        pattern: { type: string }
+        type: { type: string, enum: [WORD, PHISHING] }
+        isRegex: { type: boolean }
+        createdAt: { type: string, format: date-time }
+
+    RequestExample:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        text: { type: string }
+        sortOrder: { type: integer }
+
+    Setting:
+      type: object
+      properties:
+        key: { type: string }
+        value: { type: string }
+        valueType: { type: string, enum: [INT, STRING, BOOL, JSON] }
+        description: { type: string, nullable: true }
+        updatedAt: { type: string, format: date-time }
+
+    Policy:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        type: { type: string, enum: [TERMS, PRIVACY, MARKETING] }
+        version: { type: string }
+        title: { type: string }
+        isRequired: { type: boolean }
+        isCurrent: { type: boolean }
+        effectiveAt: { type: string, format: date-time }
+
+    Metrics:
+      type: object
+      description: 운영 지표 (A-12). 수치는 기간 집계.
+      properties:
+        periodFrom: { type: string, format: date }
+        periodTo: { type: string, format: date }
+        weeklyConnections: { type: integer, description: 주간 연결 수(응원받은 낭독 + 전달된 편지) }
+        reEngagementRate: { type: number, format: float, description: 재참여율 }
+        cheeredReadingRate: { type: number, format: float, description: 응원받은 낭독 비율 }
+        letterDeliveryRate: { type: number, format: float, description: 편지 도착률 }
+        reviewWaitMedianHours: { type: number, format: float, description: 검수 대기 시간 중간값 }
+        reportRate: { type: number, format: float, description: 신고율 }
