@@ -1,0 +1,663 @@
+openapi: 3.0.3
+info:
+  title: 토독(Todok) 편지 · 우체통 · 북마크 API
+  version: 0.1.0-draft
+  description: |
+    개발자 2 담당 앱 API 17개 (편지 요청 6 + 편지 보내기·우체통·북마크 11)의 요청·응답 필드·타입 명세.
+    작성일 2026-11-27. 기준: 통합ERD_v1.0_11-28 · API 명세서 v1.0 · MoSCoW v4.0.
+
+    [공통 규칙 — 11/27 공통 규격 확정 가정]
+    - 모든 응답은 성공 시 `{ "data": <body> }`, 실패 시 `{ "error": { code, message, details? } }` 봉투로 감싼다.
+      본 문서의 성공 응답 스키마는 봉투 안의 `data` 본문만 보여준다(봉투는 공통 레이어가 적용).
+    - 목록은 커서 페이지네이션: query `cursor`(opaque), `limit`(기본 20·최대 50) / 응답 `meta.nextCursor`(마지막이면 null).
+    - 시간은 모두 ISO-8601 UTC(TIMESTAMPTZ). 앱이 "n분 전/n시간 남음"으로 변환.
+    - 자원 식별자(`id`)는 순번 PK가 아닌 `public_id`(UUID). 내부 FK는 노출하지 않는다(D-2 보안).
+    - 평가 없는 구조(C-09): 재생 수·반응 수·편지 수 등 비교용 숫자는 응답에 포함하지 않는다.
+    - 음성은 서버를 거치지 않는다: 업로드는 서명 URL로 S3 직접 PUT → 완료 API 호출, 재생은 짧은 서명 URL 스트리밍.
+    - 모든 엔드포인트 로그인 필수(S-01). Access 만료 시 401 AUTH_EXPIRED → 앱이 /auth/refresh.
+
+servers:
+  - url: https://api.todok.example/api/v1
+    description: (초안) 운영
+  - url: https://dev-api.todok.example/api/v1
+    description: (초안) 개발
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: letter-requests
+    description: 편지 요청 (6)
+  - name: letters
+    description: 편지 보내기 · 우체통 · 북마크 (11)
+
+paths:
+  # ============================================================
+  # 편지 요청 6개
+  # ============================================================
+  /letter-requests/examples:
+    get:
+      tags: [letter-requests]
+      summary: 듣고 싶은 문구 예시 칩 (L-02·A-10)
+      operationId: getLetterRequestExamples
+      responses:
+        '200':
+          description: 예시 칩 목록
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/ExampleChip' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /letter-requests/check:
+    post:
+      tags: [letter-requests]
+      summary: 보내기 전 금지어·피싱 패턴 미리 확인 (L-02·A-08)
+      operationId: checkLetterRequest
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LetterRequestCheckRequest' }
+      responses:
+        '200':
+          description: 검사 결과 (차단 여부)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [blocked]
+                properties:
+                  blocked: { type: boolean, description: true면 금지어·피싱 포함 }
+                  reasonType:
+                    type: string
+                    nullable: true
+                    enum: [WORD, PHISHING]
+                    description: blocked=true일 때 걸린 이유 종류
+        '400':
+          description: 글자 수 초과
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+              example: { error: { code: TEXT_TOO_LONG, message: "제목 10자·문구 50자를 넘었어요", details: { maxTitle: 10, maxContent: 50 } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /letter-requests:
+    post:
+      tags: [letter-requests]
+      summary: 편지 요청 제출 → 확인 중, 글 검수 등록 (L-02·A-01)
+      operationId: createLetterRequest
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LetterRequestCreateRequest' }
+      responses:
+        '201':
+          description: 제출 완료 (REVIEWING)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MyLetterRequest' }
+        '400':
+          description: 글자 수 초과
+          content: { application/json: { schema: { $ref: '#/components/schemas/ApiError' }, example: { error: { code: TEXT_TOO_LONG, message: "글자 수를 확인해 주세요", details: { maxTitle: 10, maxContent: 50 } } } } }
+        '403':
+          description: 제재 중
+          content: { application/json: { schema: { $ref: '#/components/schemas/ApiError' }, example: { error: { code: SANCTIONED, message: "제한 기간에는 요청할 수 없어요", details: { releaseAt: "2026-12-04T00:00:00Z" } } } } }
+        '409':
+          description: 24시간 쿨다운
+          content: { application/json: { schema: { $ref: '#/components/schemas/ApiError' }, example: { error: { code: REQUEST_COOLDOWN, message: "잠시 뒤에 다시 요청할 수 있어요", details: { retryAt: "2026-11-28T09:00:00Z" } } } } }
+        '422':
+          description: 금지어·피싱 패턴
+          content: { application/json: { schema: { $ref: '#/components/schemas/ApiError' }, example: { error: { code: TEXT_BLOCKED, message: "이 내용은 보낼 수 없어요", details: { reasonType: PHISHING } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    get:
+      tags: [letter-requests]
+      summary: 읽어줄 편지 목록 (마감 임박 묶음 + 오래된 순) (L-03)
+      description: 본인 요청·본인이 신고한 요청 제외. closingSoon은 상단 강조용 중복 묶음. 마감 임박 기준 시간은 settings.request_closing_soon_hours(미정).
+      operationId: getOpenLetterRequests
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: 읽어줄 요청 목록
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  closingSoon:
+                    type: array
+                    description: 마감 임박 묶음(상단 강조)
+                    items: { $ref: '#/components/schemas/OpenLetterRequestCard' }
+                  items:
+                    type: array
+                    description: 전체 목록, 요청된 지 오래된 순
+                    items: { $ref: '#/components/schemas/OpenLetterRequestCard' }
+                  meta: { $ref: '#/components/schemas/PageMeta' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /letter-requests/{id}:
+    get:
+      tags: [letter-requests]
+      summary: 요청 상세 (제목·듣고 싶은 말·남은 시간) (L-03·L-04)
+      operationId: getLetterRequest
+      parameters:
+        - $ref: '#/components/parameters/PublicId'
+      responses:
+        '200':
+          description: 요청 상세
+          content: { application/json: { schema: { $ref: '#/components/schemas/OpenLetterRequestCard' } } }
+        '410':
+          description: 마감·삭제된 요청
+          content: { application/json: { schema: { $ref: '#/components/schemas/ApiError' }, example: { error: { code: REQUEST_CLOSED, message: "마감된 요청이에요" } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /users/me/letter-requests:
+    get:
+      tags: [letter-requests]
+      summary: 내 요청 상태 (확인 중·게시됨·반려) (L-02·L-09)
+      operationId: getMyLetterRequests
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: 내 요청 목록
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/MyLetterRequest' }
+                  meta: { $ref: '#/components/schemas/PageMeta' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ============================================================
+  # 편지 보내기 · 우체통 · 북마크 11개
+  # ============================================================
+  /stamps:
+    get:
+      tags: [letters]
+      summary: 우표 목록 (L-05·A-07)
+      operationId: getStamps
+      responses:
+        '200':
+          description: 활성 우표 목록(sortOrder 순)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Stamp' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /letters/upload-url:
+    post:
+      tags: [letters]
+      summary: 보내기 가능 여부 확인 후 S3 업로드용 서명 URL 발급 (L-04)
+      description: 30초 이내·하루 10통·요청 게시 중·제재 여부 확인 후 발급.
+      operationId: createLetterUploadUrl
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LetterUploadUrlRequest' }
+      responses:
+        '200':
+          description: 서명 URL
+          content: { application/json: { schema: { $ref: '#/components/schemas/UploadUrlResponse' } } }
+        '400':
+          description: 녹음 길이 초과
+          content: { application/json: { schema: { $ref: '#/components/schemas/ApiError' }, example: { error: { code: RECORDING_TOO_LONG, message: "녹음이 너무 길어요", details: { limitSec: 30 } } } } }
+        '403':
+          description: 제재 중
+          content: { application/json: { schema: { $ref: '#/components/schemas/ApiError' }, example: { error: { code: SANCTIONED, message: "제한 기간에는 편지를 보낼 수 없어요", details: { releaseAt: "2026-12-04T00:00:00Z" } } } } }
+        '409':
+          description: 하루 10통 소진 또는 마감된 요청
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+              examples:
+                dailyLimit: { value: { error: { code: LETTER_DAILY_LIMIT, message: "오늘은 충분히 보내주셨어요", details: { retryAt: "2026-11-28T00:00:00Z" } } } }
+                closed:     { value: { error: { code: REQUEST_CLOSED, message: "마감된 요청이에요" } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /letters:
+    post:
+      tags: [letters]
+      summary: 편지 제출 (음성 + 요청 + 우표) → 확인 중, STT·검수 등록 (L-04·L-05·A-02)
+      description: 우표 1개 필수. S3 업로드 완료 후 호출. 제출 시각이 요청 마감 시각 이하면 마감 뒤 검수 통과해도 전달(L-04 가정).
+      operationId: createLetter
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LetterCreateRequest' }
+      responses:
+        '201':
+          description: 제출 완료 (REVIEWING)
+          content: { application/json: { schema: { $ref: '#/components/schemas/SentLetter' } } }
+        '400':
+          description: 우표 미선택
+          content: { application/json: { schema: { $ref: '#/components/schemas/ApiError' }, example: { error: { code: STAMP_REQUIRED, message: "우표를 골라 붙여주세요" } } } }
+        '409':
+          description: 마감된 요청
+          content: { application/json: { schema: { $ref: '#/components/schemas/ApiError' }, example: { error: { code: REQUEST_CLOSED, message: "마감된 요청이에요" } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /mailbox:
+    get:
+      tags: [letters]
+      summary: 우체통 (안 읽은 편지 수 + 받은 편지 카드) (L-01·L-06)
+      description: 안 읽은 편지는 최신순 최대 5개. unreadCount 함께 반환.
+      operationId: getMailbox
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: 우체통
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  unreadCount: { type: integer, description: 안 읽은 편지 수(최대 5) }
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/MailboxItem' }
+                  meta: { $ref: '#/components/schemas/PageMeta' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /letters/{id}/open:
+    post:
+      tags: [letters]
+      summary: 편지 처음 열기 → 24시간 시작 + 재생 URL (L-06)
+      description: 처음 연 시각 기록, 그때부터 24시간 다시 듣기 가능. 보낸 사람에게 읽음 알리지 않음.
+      operationId: openLetter
+      parameters:
+        - $ref: '#/components/parameters/PublicId'
+      responses:
+        '200':
+          description: 열람 성공
+          content: { application/json: { schema: { $ref: '#/components/schemas/LetterOpenResponse' } } }
+        '410':
+          description: 만료·삭제된 편지
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+              examples:
+                expired:     { value: { error: { code: LETTER_EXPIRED, message: "사라진 편지예요" } } }
+                unavailable: { value: { error: { code: CONTENT_UNAVAILABLE, message: "더 이상 들을 수 없는 편지예요" } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /letters/{id}/stream-url:
+    get:
+      tags: [letters]
+      summary: 다시 듣기용 짧은 서명 URL (24h 안 또는 북마크) (L-06·L-10)
+      operationId: getLetterStreamUrl
+      parameters:
+        - $ref: '#/components/parameters/PublicId'
+      responses:
+        '200':
+          description: 재생 URL
+          content: { application/json: { schema: { $ref: '#/components/schemas/StreamUrlResponse' } } }
+        '410':
+          description: 만료·삭제된 편지
+          content: { application/json: { schema: { $ref: '#/components/schemas/ApiError' }, example: { error: { code: LETTER_EXPIRED, message: "사라진 편지예요" } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /letters/{id}/reactions:
+    post:
+      tags: [letters]
+      summary: 받은 편지에 응원 반응 (C-01)
+      description: 정해진 긍정 반응 중 1개. 사용자당 대상 1개(변경 가능). 반응 수는 노출 안 함(C-09).
+      operationId: reactToLetter
+      parameters:
+        - $ref: '#/components/parameters/PublicId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reactionType]
+              properties:
+                reactionType: { type: string, description: GET /reaction-types의 코드 중 하나 }
+      responses:
+        '204': { description: 반영 완료 }
+        '410':
+          description: 숨겨진·삭제된 편지
+          content: { application/json: { schema: { $ref: '#/components/schemas/ApiError' }, example: { error: { code: CONTENT_UNAVAILABLE, message: "더 이상 들을 수 없는 편지예요" } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /users/me/sent-letters:
+    get:
+      tags: [letters]
+      summary: 보낸 편지 (확인 중·전달됨 + 상대 반응) (L-08)
+      description: 읽음·안 읽음은 주지 않는다.
+      operationId: getSentLetters
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: 보낸 편지 목록
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/SentLetter' }
+                  meta: { $ref: '#/components/schemas/PageMeta' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /users/me/sent-letters/{id}:
+    delete:
+      tags: [letters]
+      summary: 보낸 편지 회수·삭제 (받는 사람 목록·북마크에서도 삭제) (S-04)
+      operationId: deleteSentLetter
+      parameters:
+        - $ref: '#/components/parameters/PublicId'
+      responses:
+        '204': { description: 삭제 완료 }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /users/me/bookmarks:
+    get:
+      tags: [letters]
+      summary: 편지 북마크 모음 (받은 + 보낸, 최신순) (L-10)
+      operationId: getLetterBookmarks
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: 북마크 목록
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/BookmarkItem' }
+                  meta: { $ref: '#/components/schemas/PageMeta' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /letters/{id}/bookmark:
+    put:
+      tags: [letters]
+      summary: 편지 북마크 추가 (받은+보낸 합산 최대 30) (L-10)
+      description: 30개가 차 있으면 409 BOOKMARK_FULL + 가장 오래된 북마크 정보. replaceOldest=true로 재요청하면 가장 오래된 1개를 지우고 저장.
+      operationId: addLetterBookmark
+      parameters:
+        - $ref: '#/components/parameters/PublicId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                replaceOldest: { type: boolean, default: false, description: true면 가장 오래된 북마크 1개 삭제 후 저장 }
+      responses:
+        '200':
+          description: 북마크 완료
+          content: { application/json: { schema: { $ref: '#/components/schemas/BookmarkItem' } } }
+        '409':
+          description: 북마크 30개 가득
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+              example: { error: { code: BOOKMARK_FULL, message: "가장 오래된 북마크 1개가 삭제돼요", details: { oldestBookmark: { id: "a1b2c3d4-0000-0000-0000-000000000000", requestTitle: "오늘 하루", direction: RECEIVED } } } }
+        '410':
+          description: 숨겨진·삭제된 편지
+          content: { application/json: { schema: { $ref: '#/components/schemas/ApiError' }, example: { error: { code: CONTENT_UNAVAILABLE, message: "더 이상 들을 수 없는 편지예요" } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    delete:
+      tags: [letters]
+      summary: 편지 북마크 해제 (L-10)
+      description: 풀면 일반 규칙(연 지 24시간 뒤 삭제)을 따른다.
+      operationId: removeLetterBookmark
+      parameters:
+        - $ref: '#/components/parameters/PublicId'
+      responses:
+        '204': { description: 해제 완료 }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+# ================================================================
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    PublicId:
+      name: id
+      in: path
+      required: true
+      description: 자원의 public_id (UUID)
+      schema: { type: string, format: uuid }
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: 다음 페이지 커서(opaque). 첫 페이지는 생략.
+      schema: { type: string }
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema: { type: integer, default: 20, minimum: 1, maximum: 50 }
+
+  responses:
+    Unauthorized:
+      description: 로그인 토큰 만료·누락
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+          example: { error: { code: AUTH_EXPIRED, message: "다시 로그인해 주세요" } }
+    NotFound:
+      description: 대상 없음
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+          example: { error: { code: CONTENT_UNAVAILABLE, message: "대상을 찾을 수 없어요" } }
+
+  schemas:
+    # ---------- 공통 ----------
+    ApiError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum:
+                [AUTH_EXPIRED, SANCTIONED, UPDATE_REQUIRED, SERVER_ERROR,
+                 TEXT_TOO_LONG, TEXT_BLOCKED, REQUEST_COOLDOWN, REQUEST_CLOSED,
+                 RECORDING_TOO_LONG, LETTER_DAILY_LIMIT, STAMP_REQUIRED,
+                 LETTER_EXPIRED, BOOKMARK_FULL, CONTENT_UNAVAILABLE]
+            message: { type: string, description: 사용자 노출 문구(MoSCoW 문구표 기준) }
+            details:
+              type: object
+              nullable: true
+              description: 코드별 부가 정보(retryAt·limitSec·releaseAt·reasonType·maxTitle·maxContent·oldestBookmark 등)
+              additionalProperties: true
+
+    PageMeta:
+      type: object
+      properties:
+        nextCursor: { type: string, nullable: true, description: 마지막 페이지면 null }
+
+    # ---------- 편지 요청 ----------
+    ExampleChip:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        text: { type: string, example: "오늘 하루 수고했어요" }
+
+    LetterRequestCheckRequest:
+      type: object
+      required: [title, content]
+      properties:
+        title: { type: string, maxLength: 10 }
+        content: { type: string, maxLength: 50 }
+
+    LetterRequestCreateRequest:
+      type: object
+      required: [title, content]
+      properties:
+        title: { type: string, maxLength: 10, description: 제목 10자 }
+        content: { type: string, maxLength: 50, description: 듣고 싶은 말 50자 }
+
+    LetterRequestStatus:
+      type: string
+      enum: [REVIEWING, PUBLISHED, REJECTED, CLOSING, CLOSED, EXPIRED]
+      description: |
+        REVIEWING 확인 중 · PUBLISHED 게시됨 · REJECTED 반려 ·
+        CLOSING 마감 보류(검수 중 편지 대기) · CLOSED 마감(1통+) · EXPIRED 0통 삭제(L-09)
+
+    OpenLetterRequestCard:
+      type: object
+      description: 읽어줄 편지 목록·상세 (요청자 익명)
+      properties:
+        id: { type: string, format: uuid }
+        title: { type: string }
+        content: { type: string, description: 듣고 싶은 말 }
+        expiresAt: { type: string, format: date-time, description: 게시 마감 시각(남은 시간 계산용) }
+        closingSoon: { type: boolean, description: 마감 임박 여부 }
+
+    MyLetterRequest:
+      type: object
+      description: 내 요청 상태
+      properties:
+        id: { type: string, format: uuid }
+        title: { type: string }
+        content: { type: string }
+        status: { $ref: '#/components/schemas/LetterRequestStatus' }
+        publishedAt: { type: string, format: date-time, nullable: true }
+        expiresAt: { type: string, format: date-time, nullable: true, description: 게시 중일 때 남은 시간 }
+        rejectReason: { type: string, nullable: true, description: 반려 시 안전 사유 }
+        createdAt: { type: string, format: date-time }
+
+    # ---------- 우표 ----------
+    Stamp:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        imageUrl: { type: string, format: uri }
+        sortOrder: { type: integer }
+
+    # ---------- 편지 보내기 ----------
+    LetterUploadUrlRequest:
+      type: object
+      required: [requestId, durationSec]
+      properties:
+        requestId: { type: string, format: uuid, description: 대상 편지 요청 public_id }
+        durationSec: { type: integer, maximum: 30, description: 녹음 길이(검증용) }
+        contentType: { type: string, example: "audio/mp4", description: 업로드 파일 MIME }
+        fileSize: { type: integer, description: 바이트(크기 검증용) }
+
+    UploadUrlResponse:
+      type: object
+      properties:
+        uploadUrl: { type: string, format: uri, description: S3 PUT 서명 URL }
+        audioKey: { type: string, description: 업로드 후 POST /letters에 전달할 S3 키 }
+        method: { type: string, example: PUT }
+        headers:
+          type: object
+          additionalProperties: { type: string }
+          description: PUT 시 함께 보낼 헤더(Content-Type 등)
+        expiresAt: { type: string, format: date-time, description: 서명 URL 만료 }
+
+    LetterCreateRequest:
+      type: object
+      required: [requestId, audioKey, stampId, durationSec]
+      properties:
+        requestId: { type: string, format: uuid }
+        audioKey: { type: string, description: upload-url에서 받은 키 }
+        stampId: { type: string, format: uuid, description: 우표 1개 필수 }
+        durationSec: { type: integer, maximum: 30 }
+
+    LetterStatus:
+      type: string
+      enum: [REVIEWING, PUBLISHED, REJECTED, WITHDRAWN]
+      description: REVIEWING 확인 중 · PUBLISHED 전달됨 · REJECTED 반려 · WITHDRAWN 회수·삭제
+
+    SentLetter:
+      type: object
+      description: 보낸 편지 (읽음 정보 없음)
+      properties:
+        id: { type: string, format: uuid }
+        requestTitle: { type: string, description: 대상 요청 제목 }
+        status: { $ref: '#/components/schemas/LetterStatus' }
+        stampImageUrl: { type: string, format: uri }
+        reaction:
+          type: string
+          nullable: true
+          description: 상대가 보낸 응원 반응 코드(없으면 null). 개수 아님(C-09)
+        submittedAt: { type: string, format: date-time }
+        deliveredAt: { type: string, format: date-time, nullable: true }
+
+    # ---------- 우체통 ----------
+    MailboxItem:
+      type: object
+      description: 받은 편지 카드
+      properties:
+        id: { type: string, format: uuid, description: 편지 public_id }
+        requestTitle: { type: string, description: 내가 요청했던 제목 }
+        stampImageUrl: { type: string, format: uri }
+        isRead: { type: boolean }
+        receivedAt: { type: string, format: date-time }
+        expiresAt: { type: string, format: date-time, nullable: true, description: 연 편지의 소멸 시각(opened+24h), 안 열었으면 null }
+        bookmarked: { type: boolean }
+        reaction: { type: string, nullable: true, description: 내가 보낸 응원 반응 코드 }
+
+    LetterOpenResponse:
+      type: object
+      properties:
+        streamUrl: { type: string, format: uri, description: 재생 서명 URL }
+        streamUrlExpiresAt: { type: string, format: date-time, description: 서명 URL 만료(음성 길이 + 여유) }
+        openedAt: { type: string, format: date-time }
+        mailboxExpiresAt: { type: string, format: date-time, description: 편지 소멸 시각(openedAt + 24h) }
+
+    StreamUrlResponse:
+      type: object
+      properties:
+        streamUrl: { type: string, format: uri }
+        expiresAt: { type: string, format: date-time }
+
+    # ---------- 북마크 ----------
+    BookmarkDirection:
+      type: string
+      enum: [RECEIVED, SENT]
+
+    BookmarkItem:
+      type: object
+      properties:
+        id: { type: string, format: uuid, description: 편지 public_id }
+        direction: { $ref: '#/components/schemas/BookmarkDirection' }
+        requestTitle: { type: string }
+        stampImageUrl: { type: string, format: uri }
+        bookmarkedAt: { type: string, format: date-time }
